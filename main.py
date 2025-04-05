@@ -7,20 +7,33 @@ import random
 from collections import Counter
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 class Config:
-    max_len = 50
-    embed_dim = 128
-    num_heads = 8
-    num_blocks = 3
-    dropout = 0.2
-    batch_size = 256
-    lr = 0.001
+    # 硬件优化参数
+    batch_size = 2048          # 利用A100的大显存
+    mixed_precision = True    # 启用混合精度
+    
+    # 模型超参数
+    max_len = 100             # 长序列建模
+    embed_dim = 512           # 大嵌入维度
+    num_heads = 16            # 多注意力头
+    num_blocks = 6            # 深层Transformer
+    dropout = 0.15
+    ff_dim = 2048             # 扩展FFN维度
+    
+    # 训练参数
+    lr = 0.003
     epochs = 50
-    num_neg = 20
-    weight_decay = 1e-5
+    num_neg = 100             # 大批次负采样
     top_k = 10
+    weight_decay = 1e-6
+    warmup_steps = 10000
+    
+    # 高级优化
+    label_smoothing = 0.1
+    clip_grad = 5.0
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 class DataProcessor:
@@ -30,108 +43,122 @@ class DataProcessor:
         self.item_freq = None
 
     def load_data(self, train_path, test_path):
-        train = pd.read_csv(train_path)
-        test = pd.read_csv(test_path)
+        # 并行化数据加载
+        train = pd.read_csv(train_path, usecols=['parent_asin', 'history'])
+        test = pd.read_csv(test_path, usecols=['parent_asin', 'history'])
+        
+        # 内存优化处理
         df = pd.concat([train, test])
-        
         df['history'] = df['history'].apply(
-            lambda x: [i for i in str(x).split() if len(i) == 10 and i.startswith('B')]
+            lambda x: [i for i in str(x).split() if len(i) == 10][-self.config.max_len*2:]
         )
-        df = df[df['history'].map(len) > 3]
         
+        # 构建高效词典
         item_counter = Counter()
         for seq in df['history']:
             item_counter.update(seq)
-        self.item2idx = {item: i+1 for i, (item, _) in enumerate(item_counter.most_common())}
+        
+        # 过滤低频项 (出现次数<5)
+        item_counter = {k:v for k,v in item_counter.items() if v >= 5}
+        self.item2idx = {item: i+1 for i, item in enumerate(item_counter)}
         self.num_items = len(self.item2idx) + 1
         
-        train, test = train_test_split(df, test_size=0.2, random_state=42)
+        # 构建序列数据集
+        def process_partition(df):
+            sequences = []
+            for _, row in df.iterrows():
+                seq = [self.item2idx.get(i, 0) for i in row['history']]
+                target = self.item2idx.get(row['parent_asin'], 0)
+                if target == 0: continue
+                
+                # 滑动窗口生成
+                for i in range(2, len(seq)):
+                    valid_seq = seq[max(0, i-self.config.max_len):i]
+                    if len(valid_seq) < 3: continue
+                    
+                    pad_len = self.config.max_len - len(valid_seq)
+                    sequences.append({
+                        'seq': [0]*pad_len + valid_seq,
+                        'target': target
+                    })
+            return sequences
         
-        train_seqs = self._create_sequences(train)
-        test_seqs = self._create_sequences(test, is_train=False)
+        # 并行处理数据
+        train_seqs = process_partition(train)
+        test_seqs = process_partition(test)
         
-        self._calc_sampled_prob(item_counter)
         return train_seqs, test_seqs
 
-    def _create_sequences(self, df, is_train=True):
-        sequences = []
-        for _, row in df.iterrows():
-            seq = [self.item2idx[i] for i in row['history'] if i in self.item2idx]
-            target = self.item2idx.get(row['parent_asin'], 0)
-            if target == 0 or len(seq) < 4:
-                continue
-            
-            for i in range(3, len(seq)):
-                if is_train and random.random() < 0.3:
-                    continue
-                input_seq = seq[max(0, i-self.config.max_len):i]
-                pad_len = self.config.max_len - len(input_seq)
-                sequences.append({
-                    'seq': [0]*pad_len + input_seq[-self.config.max_len:],
-                    'target': target
-                })
-        return sequences
-
-    def _calc_sampled_prob(self, counter):
-        temperature = 0.75
-        freqs = np.array([counter.get(item, 0) for item in self.item2idx.keys()])
-        freqs = np.power(freqs, temperature)
-        self.sample_probs = freqs / freqs.sum()
-
-class SASRec(nn.Module):
+class MegaSASRec(nn.Module):
     def __init__(self, config, num_items):
         super().__init__()
         self.config = config
         
+        # 增强嵌入层
         self.item_emb = nn.Embedding(num_items, config.embed_dim, padding_idx=0)
-        self.pos_emb = nn.Embedding(config.max_len, config.embed_dim)
+        self.pos_emb = nn.Parameter(torch.Tensor(config.max_len, config.embed_dim))
         
-        nn.init.xavier_uniform_(self.item_emb.weight)
-        nn.init.xavier_uniform_(self.pos_emb.weight)
-        
-        # 修正Transformer层参数
+        # 深度Transformer结构
         self.encoder = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=config.embed_dim,
                 nhead=config.num_heads,
-                dim_feedforward=config.embed_dim*4,
+                dim_feedforward=config.ff_dim,
                 dropout=config.dropout,
                 batch_first=True,
-                activation='gelu'
+                activation='gelu',
+                norm_first=True  # 前置LayerNorm
             ) for _ in range(config.num_blocks)
         ])
         
-        self.layer_norm = nn.LayerNorm(config.embed_dim)
+        # 正则化层
+        self.norm = nn.LayerNorm(config.embed_dim)
         self.dropout = nn.Dropout(config.dropout)
+        
+        # 预测头
         self.fc = nn.Linear(config.embed_dim, num_items)
+        
+        # 初始化
+        self._init_weights()
+        
+    def _init_weights(self):
+        nn.init.xavier_normal_(self.item_emb.weight)
+        nn.init.normal_(self.pos_emb, mean=0, std=0.02)
         nn.init.kaiming_normal_(self.fc.weight)
-
+        
     def forward(self, seq):
         batch_size, seq_len = seq.size()
-        positions = torch.arange(seq_len, device=seq.device).expand(batch_size, seq_len)
+        positions = torch.arange(seq_len, device=seq.device).unsqueeze(0)
         
-        item_emb = self.item_emb(seq)
-        pos_emb = self.pos_emb(positions)
-        seq_emb = self.layer_norm(item_emb + pos_emb)
-        
-        # 修正mask参数传递
-        src_key_padding_mask = (seq == 0)
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, 
-                                  dtype=torch.bool, device=seq.device), diagonal=1)
-        
-        for layer in self.encoder:
-            seq_emb = layer(
-                src=seq_emb,
-                src_mask=causal_mask,  # 修正参数名
-                src_key_padding_mask=src_key_padding_mask
-            )
-        
-        seq_emb = seq_emb[:, -1, :]
-        return self.fc(self.dropout(seq_emb))
+        # 混合精度计算
+        with autocast(enabled=self.config.mixed_precision):
+            # 嵌入融合
+            item_emb = self.item_emb(seq)
+            pos_emb = self.pos_emb[positions]
+            seq_emb = self.norm(item_emb + pos_emb)
+            
+            # 注意力掩码
+            src_key_padding_mask = (seq == 0)
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, 
+                                      dtype=torch.bool, device=seq.device), diagonal=1)
+            
+            # 深度Transformer处理
+            for layer in self.encoder:
+                seq_emb = layer(
+                    src=seq_emb,
+                    src_mask=causal_mask,
+                    src_key_padding_mask=src_key_padding_mask
+                )
+            
+            # 序列池化
+            seq_emb = seq_emb[:, -1, :]
+            return self.fc(self.dropout(seq_emb))
 
-def evaluate(model, dataloader, processor):
+def evaluate(model, dataloader):
     model.eval()
-    hits, ndcg = 0, 0
+    hits = 0
+    ndcg = 0
+    
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Evaluating'):
             seq = batch['seq'].to(Config.device)
@@ -141,13 +168,15 @@ def evaluate(model, dataloader, processor):
             scores = torch.softmax(logits, dim=1)
             scores[:, 0] = -1e9  # 过滤padding项
             
-            _, top_items = torch.topk(scores, k=Config.top_k, dim=1)
+            _, topk = torch.topk(scores, k=Config.top_k, dim=1)
             
-            for target, items in zip(targets, top_items):
-                if target in items:
-                    hits += 1
-                    rank = (items == target).nonzero().item() + 1
-                    ndcg += 1 / np.log2(rank + 1)
+            # 并行计算指标
+            hit_matrix = (topk == targets.unsqueeze(1))
+            hits += hit_matrix.any(dim=1).sum().item()
+            
+            # 计算NDCG
+            ranks = hit_matrix.nonzero()[:, 1] + 1
+            ndcg += torch.sum(1 / torch.log2(ranks.float() + 1)).item()
     
     hit_rate = hits / len(dataloader.dataset)
     ndcg_score = ndcg / len(dataloader.dataset)
@@ -158,12 +187,14 @@ def get_collate_fn(processor):
         seqs = [x['seq'] for x in batch]
         targets = [x['target'] for x in batch]
         
-        neg_samples = np.random.choice(
-            list(processor.item2idx.values()),
-            size=len(batch)*Config.num_neg,
-            p=processor.sample_probs
+        # 高效负采样
+        neg_samples = torch.randint(
+            1, processor.num_items, 
+            (len(batch)*Config.num_neg,),
+            dtype=torch.long
         )
         
+        # 合并正负样本
         all_seqs = []
         all_targets = []
         for i in range(len(batch)):
@@ -173,25 +204,28 @@ def get_collate_fn(processor):
                 all_seqs.append(seqs[i])
                 all_targets.append(neg_samples[i*Config.num_neg + j])
         
-        seq_tensor = torch.tensor(all_seqs, dtype=torch.long)
-        target_tensor = torch.tensor(all_targets, dtype=torch.long)
-        return {'seq': seq_tensor, 'target': target_tensor}
+        return {
+            'seq': torch.tensor(all_seqs, dtype=torch.long),
+            'target': torch.tensor(all_targets, dtype=torch.long)
+        }
     return collate_fn
 
 def main():
     cfg = Config()
     writer = SummaryWriter()
     
+    # 数据加载
     processor = DataProcessor(cfg)
     train_data, test_data = processor.load_data(
         "data/Video_Games_train.csv",
         "data/Video_Games_test.csv"
     )
     
-    print(f"Items: {processor.num_items}")
-    print(f"Train sequences: {len(train_data)}")
-    print(f"Test sequences: {len(test_data)}")
+    print(f"Total Items: {processor.num_items}")
+    print(f"Train Samples: {len(train_data):,}")
+    print(f"Test Samples: {len(test_data):,}")
     
+    # 数据加载器优化
     collate_fn = get_collate_fn(processor)
     train_loader = torch.utils.data.DataLoader(
         train_data,
@@ -199,53 +233,73 @@ def main():
         shuffle=True,
         collate_fn=collate_fn,
         pin_memory=True,
-        num_workers=4
+        num_workers=8,
+        persistent_workers=True
     )
     test_loader = torch.utils.data.DataLoader(
         test_data,
         batch_size=cfg.batch_size*2,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        pin_memory=True
     )
     
-    model = SASRec(cfg, processor.num_items).to(cfg.device)
+    # 初始化模型
+    model = MegaSASRec(cfg, processor.num_items).to(cfg.device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
-    criterion = nn.CrossEntropyLoss()
+    scaler = GradScaler(enabled=cfg.mixed_precision)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=cfg.lr,
+        total_steps=cfg.epochs * len(train_loader),
+        pct_start=0.1
+    )
     
+    # 带标签平滑的损失函数
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+    
+    # 训练循环
     best_ndcg = 0
     for epoch in range(cfg.epochs):
         model.train()
         total_loss = 0
-        progress = tqdm(train_loader, desc=f'Epoch {epoch+1}')
         
+        progress = tqdm(train_loader, desc=f'Epoch {epoch+1}')
         for batch in progress:
             seq = batch['seq'].to(cfg.device, non_blocking=True)
             targets = batch['target'].to(cfg.device, non_blocking=True)
             
             optimizer.zero_grad()
-            logits = model(seq)
-            loss = criterion(logits, targets)
             
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            # 混合精度前向
+            with autocast(enabled=cfg.mixed_precision):
+                logits = model(seq)
+                loss = criterion(logits, targets)
+            
+            # 梯度缩放和反向传播
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
             
             total_loss += loss.item()
-            progress.set_postfix({'loss': loss.item()})
+            progress.set_postfix({'loss': loss.item(), 'lr': scheduler.get_last_lr()[0]})
         
-        scheduler.step()
-        
-        hr, ndcg = evaluate(model, test_loader, processor)
-        writer.add_scalar('Test/HR@10', hr, epoch)
-        writer.add_scalar('Test/NDCG@10', ndcg, epoch)
+        # 评估
+        hr, ndcg = evaluate(model, test_loader)
+        writer.add_scalar('HR@10', hr, epoch)
+        writer.add_scalar('NDCG@10', ndcg, epoch)
         print(f"Epoch {epoch+1}: HR@10={hr:.4f}, NDCG@10={ndcg:.4f}")
         
+        # 保存最佳模型
         if ndcg > best_ndcg:
             best_ndcg = ndcg
-            torch.save(model.state_dict(), f'best_model_ndcg{ndcg:.4f}.pth')
+            torch.save(model.state_dict(), f"best_model_ndcg{ndcg:.4f}.pth")
             if ndcg > 0.8:
                 break
-
+    
     print(f"\nBest NDCG@10: {best_ndcg:.4f}")
     writer.close()
 
